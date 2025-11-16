@@ -10,7 +10,15 @@ from .models import (
     StudentPLOAchievement,
     LearningOutcome,
     ProgramOutcome,
-    Assessment
+    Assessment,
+    AssessmentLOMapping,
+    LOPOMapping,
+    StudentAssessmentScore,
+    calculate_lo_score,
+    calculate_po_score,
+    calculate_all_po_scores,
+    calculate_student_lo_scores,
+    get_student_po_summary
 )
 from .serializers import (
     ProgramLearningOutcomeSerializer,
@@ -20,7 +28,10 @@ from .serializers import (
     StudentPLOAchievementSerializer,
     LearningOutcomeSerializer,
     ProgramOutcomeSerializer,
-    AssessmentSerializer
+    AssessmentSerializer,
+    AssessmentLOMappingSerializer,
+    LOPOMappingSerializer,
+    StudentAssessmentScoreSerializer
 )
 
 
@@ -173,6 +184,7 @@ class StudentPLOAchievementViewSet(viewsets.ModelViewSet):
 class LearningOutcomeViewSet(viewsets.ModelViewSet):
     """
     ViewSet for Course Learning Outcomes (CLOs)
+    Automatically calculates and shows scores for all students.
     """
     queryset = LearningOutcome.objects.select_related('course', 'plo').all()
     serializer_class = LearningOutcomeSerializer
@@ -207,6 +219,7 @@ class LearningOutcomeViewSet(viewsets.ModelViewSet):
 class ProgramOutcomeViewSet(viewsets.ModelViewSet):
     """
     ViewSet for Program Outcomes (broader institutional goals)
+    Automatically calculates and shows scores for all students.
     """
     queryset = ProgramOutcome.objects.prefetch_related('related_plos').all()
     serializer_class = ProgramOutcomeSerializer
@@ -278,3 +291,181 @@ class AssessmentViewSet(viewsets.ModelViewSet):
         learning_outcomes = assessment.learning_outcomes.all()
         serializer = LearningOutcomeSerializer(learning_outcomes, many=True)
         return Response(serializer.data)
+
+
+class AssessmentLOMappingViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for mapping assessments to learning outcomes with contribution percentages.
+    """
+    queryset = AssessmentLOMapping.objects.select_related(
+        'assessment', 'learning_outcome', 'learning_outcome__course'
+    ).all()
+    serializer_class = AssessmentLOMappingSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['assessment__name', 'learning_outcome__code']
+    ordering_fields = ['contribution_percentage']
+    filterset_fields = ['assessment', 'learning_outcome']
+
+
+class LOPOMappingViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for mapping learning outcomes to program outcomes with weights.
+    """
+    queryset = LOPOMapping.objects.select_related(
+        'learning_outcome', 'program_outcome'
+    ).all()
+    serializer_class = LOPOMappingSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['learning_outcome__code', 'program_outcome__code']
+    ordering_fields = ['weight']
+    filterset_fields = ['learning_outcome', 'program_outcome', 'weight']
+
+
+class StudentAssessmentScoreViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for student assessment scores.
+    """
+    queryset = StudentAssessmentScore.objects.select_related(
+        'student', 'assessment', 'enrollment'
+    ).all()
+    serializer_class = StudentAssessmentScoreSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['student__name', 'assessment__name']
+    ordering_fields = ['graded_at', 'score']
+    filterset_fields = ['student', 'assessment', 'enrollment']
+
+    @action(detail=False, methods=['get'])
+    def by_student(self, request):
+        """Get all assessment scores for a specific student"""
+        student_id = request.query_params.get('student_id')
+        if not student_id:
+            return Response({'error': 'student_id is required'}, status=400)
+        
+        scores = self.queryset.filter(student_id=student_id)
+        serializer = self.get_serializer(scores, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def by_enrollment(self, request):
+        """Get all assessment scores for a specific enrollment"""
+        enrollment_id = request.query_params.get('enrollment_id')
+        if not enrollment_id:
+            return Response({'error': 'enrollment_id is required'}, status=400)
+        
+        scores = self.queryset.filter(enrollment_id=enrollment_id)
+        serializer = self.get_serializer(scores, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def calculate_lo_scores(self, request):
+        """
+        Calculate LO scores for a student in a course.
+        POST body: {"student_id": 1, "course_id": 2}
+        """
+        from students.models import Student
+        from courses.models import Course
+        
+        student_id = request.data.get('student_id')
+        course_id = request.data.get('course_id')
+        
+        if not student_id or not course_id:
+            return Response(
+                {'error': 'student_id and course_id are required'}, 
+                status=400
+            )
+        
+        try:
+            student = Student.objects.get(id=student_id)
+            course = Course.objects.get(id=course_id)
+        except (Student.DoesNotExist, Course.DoesNotExist) as e:
+            return Response({'error': str(e)}, status=404)
+        
+        # Calculate LO scores
+        lo_scores = calculate_student_lo_scores(student, course)
+        
+        result = {
+            'student': student.name,
+            'course': course.code,
+            'lo_scores': [
+                {
+                    'lo_code': lo.code,
+                    'description': lo.description,
+                    'score': round(score, 2)
+                }
+                for lo, score in lo_scores.items()
+            ]
+        }
+        
+        return Response(result)
+
+    @action(detail=False, methods=['post'])
+    def calculate_po_scores(self, request):
+        """
+        Calculate PO scores for a student.
+        POST body: {"student_id": 1, "use_credits": true}
+        """
+        from students.models import Student
+        
+        student_id = request.data.get('student_id')
+        use_credits = request.data.get('use_credits', True)
+        
+        if not student_id:
+            return Response({'error': 'student_id is required'}, status=400)
+        
+        try:
+            student = Student.objects.get(id=student_id)
+        except Student.DoesNotExist:
+            return Response({'error': 'Student not found'}, status=404)
+        
+        # Calculate PO scores
+        po_scores = calculate_all_po_scores(student, use_credits=use_credits)
+        
+        result = {
+            'student': student.name,
+            'use_credits': use_credits,
+            'po_scores': [
+                {
+                    'po_code': po.code,
+                    'title': po.title,
+                    'score': round(score, 2)
+                }
+                for po, score in po_scores.items()
+            ]
+        }
+        
+        return Response(result)
+
+    @action(detail=False, methods=['post'])
+    def student_po_summary(self, request):
+        """
+        Get comprehensive PO summary for a student.
+        POST body: {"student_id": 1}
+        """
+        from students.models import Student
+        
+        student_id = request.data.get('student_id')
+        
+        if not student_id:
+            return Response({'error': 'student_id is required'}, status=400)
+        
+        try:
+            student = Student.objects.get(id=student_id)
+        except Student.DoesNotExist:
+            return Response({'error': 'Student not found'}, status=404)
+        
+        # Get comprehensive summary
+        summary = get_student_po_summary(student)
+        
+        # Format for response
+        result = {
+            'student': {
+                'id': student.id,
+                'name': student.name,
+                'student_number': student.student_number
+            },
+            'po_scores': summary['po_scores'],
+            'statistics': summary['statistics']
+        }
+        
+        return Response(result)
+

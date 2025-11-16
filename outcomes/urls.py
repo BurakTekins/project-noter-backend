@@ -8,7 +8,10 @@ from .views import (
     StudentPLOAchievementViewSet,
     LearningOutcomeViewSet,
     ProgramOutcomeViewSet,
-    AssessmentViewSet
+    AssessmentViewSet,
+    AssessmentLOMappingViewSet,
+    LOPOMappingViewSet,
+    StudentAssessmentScoreViewSet
 )
 
 router = DefaultRouter()
@@ -20,6 +23,9 @@ router.register(r'achievements', StudentPLOAchievementViewSet, basename='achieve
 router.register(r'learning-outcomes', LearningOutcomeViewSet, basename='learning-outcome')
 router.register(r'program-outcomes', ProgramOutcomeViewSet, basename='program-outcome')
 router.register(r'assessments', AssessmentViewSet, basename='assessment')
+router.register(r'assessment-lo-mappings', AssessmentLOMappingViewSet, basename='assessment-lo-mapping')
+router.register(r'lo-po-mappings', LOPOMappingViewSet, basename='lo-po-mapping')
+router.register(r'student-scores', StudentAssessmentScoreViewSet, basename='student-score')
 
 urlpatterns = [
     path('', include(router.urls)),
