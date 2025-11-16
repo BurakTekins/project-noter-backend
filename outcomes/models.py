@@ -347,3 +347,418 @@ class Assessment(models.Model):
 
     def __str__(self):
         return f"{self.course_offering.course.code} - {self.name}"
+
+
+class AssessmentLOMapping(models.Model):
+    """
+    Maps assessments to learning outcomes with contribution percentage.
+    This defines how much each assessment contributes to a specific LO.
+    """
+    assessment = models.ForeignKey(
+        Assessment,
+        on_delete=models.CASCADE,
+        related_name='lo_mappings'
+    )
+    learning_outcome = models.ForeignKey(
+        LearningOutcome,
+        on_delete=models.CASCADE,
+        related_name='assessment_mappings'
+    )
+    contribution_percentage = models.FloatField(
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="How much this assessment contributes to the LO (0-100%)"
+    )
+
+    class Meta:
+        unique_together = ['assessment', 'learning_outcome']
+        verbose_name = 'Assessment-LO Mapping'
+        verbose_name_plural = 'Assessment-LO Mappings'
+
+    def __str__(self):
+        return f"{self.assessment.name} → {self.learning_outcome.code} ({self.contribution_percentage}%)"
+
+
+class LOPOMapping(models.Model):
+    """
+    Maps learning outcomes to program outcomes with weight (1-5 scale).
+    This defines how strongly each LO contributes to a PO.
+    """
+    learning_outcome = models.ForeignKey(
+        LearningOutcome,
+        on_delete=models.CASCADE,
+        related_name='po_mappings'
+    )
+    program_outcome = models.ForeignKey(
+        ProgramOutcome,
+        on_delete=models.CASCADE,
+        related_name='lo_mappings'
+    )
+    weight = models.IntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)],
+        help_text="Weight of LO contribution to PO (1-5 scale)"
+    )
+
+    class Meta:
+        unique_together = ['learning_outcome', 'program_outcome']
+        verbose_name = 'LO-PO Mapping'
+        verbose_name_plural = 'LO-PO Mappings'
+
+    def __str__(self):
+        return f"{self.learning_outcome.code} → {self.program_outcome.code} (weight: {self.weight})"
+
+
+class StudentAssessmentScore(models.Model):
+    """
+    Stores individual student scores for specific assessments.
+    """
+    student = models.ForeignKey(
+        'students.Student',
+        on_delete=models.CASCADE,
+        related_name='assessment_scores'
+    )
+    assessment = models.ForeignKey(
+        Assessment,
+        on_delete=models.CASCADE,
+        related_name='student_scores'
+    )
+    enrollment = models.ForeignKey(
+        Enrollment,
+        on_delete=models.CASCADE,
+        related_name='assessment_scores'
+    )
+    score = models.FloatField(
+        validators=[MinValueValidator(0)],
+        help_text="Student's score on this assessment"
+    )
+    feedback = models.TextField(blank=True)
+    graded_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        unique_together = ['student', 'assessment', 'enrollment']
+        ordering = ['-graded_at']
+        verbose_name = 'Student Assessment Score'
+        verbose_name_plural = 'Student Assessment Scores'
+
+    def __str__(self):
+        return f"{self.student.name} - {self.assessment.name}: {self.score}/{self.assessment.max_score}"
+
+    def normalized_score(self):
+        """Returns score as percentage (0-100)"""
+        if self.assessment.max_score > 0:
+            return (self.score / self.assessment.max_score) * 100
+        return 0.0
+
+
+# ============================================================================
+# CALCULATION FUNCTIONS
+# ============================================================================
+
+def calculate_lo_score(learning_outcome, student, enrollment=None):
+    """
+    Calculate Learning Outcome score for a student.
+    
+    Formula: LO_Score = Σ(AssessmentGrade * AssessmentWeight)
+    
+    Args:
+        learning_outcome: LearningOutcome instance
+        student: Student instance
+        enrollment: Optional Enrollment instance (if None, uses latest enrollment for the course)
+    
+    Returns:
+        float: LO score as percentage (0-100)
+    """
+    from students.models import Student
+    from django.db.models import Sum, Q
+    
+    # Get enrollment if not provided
+    if enrollment is None:
+        enrollment = Enrollment.objects.filter(
+            student=student,
+            course=learning_outcome.course,
+            status='COMPLETED'
+        ).order_by('-year', '-semester').first()
+        
+        if not enrollment:
+            return 0.0
+    
+    # Get all assessment mappings for this LO
+    lo_mappings = AssessmentLOMapping.objects.filter(
+        learning_outcome=learning_outcome
+    ).select_related('assessment')
+    
+    if not lo_mappings.exists():
+        return 0.0
+    
+    total_score = 0.0
+    total_weight = 0.0
+    
+    for mapping in lo_mappings:
+        # Get student's score for this assessment
+        try:
+            student_score = StudentAssessmentScore.objects.get(
+                student=student,
+                assessment=mapping.assessment,
+                enrollment=enrollment
+            )
+            
+            # Normalized score (0-100) * contribution percentage (as decimal)
+            normalized = student_score.normalized_score()
+            weight = mapping.contribution_percentage / 100.0
+            
+            total_score += normalized * weight
+            total_weight += weight
+            
+        except StudentAssessmentScore.DoesNotExist:
+            # If student hasn't taken this assessment, skip it
+            continue
+    
+    # Return weighted average
+    if total_weight > 0:
+        return total_score / total_weight
+    
+    return 0.0
+
+
+def calculate_po_score(program_outcome, student, course=None):
+    """
+    Calculate Program Outcome score for a student from Learning Outcomes.
+    
+    Formula: PO_Score = Σ(LO_Score * LO_PO_Weight) / Σ(LO_PO_Weight)
+    
+    Args:
+        program_outcome: ProgramOutcome instance
+        student: Student instance
+        course: Optional Course instance (if None, calculates across all courses)
+    
+    Returns:
+        float: PO score as percentage (0-100)
+    """
+    from django.db.models import Q
+    
+    # Get all LO-PO mappings for this PO
+    lo_po_mappings = LOPOMapping.objects.filter(
+        program_outcome=program_outcome
+    ).select_related('learning_outcome', 'learning_outcome__course')
+    
+    # Filter by course if specified
+    if course:
+        lo_po_mappings = lo_po_mappings.filter(learning_outcome__course=course)
+    
+    if not lo_po_mappings.exists():
+        return 0.0
+    
+    weighted_sum = 0.0
+    total_weight = 0.0
+    
+    for mapping in lo_po_mappings:
+        lo = mapping.learning_outcome
+        weight = mapping.weight
+        
+        # Get the most recent enrollment for this course
+        enrollment = Enrollment.objects.filter(
+            student=student,
+            course=lo.course,
+            status='COMPLETED'
+        ).order_by('-year', '-semester').first()
+        
+        if enrollment:
+            lo_score = calculate_lo_score(lo, student, enrollment)
+            
+            if lo_score > 0:
+                weighted_sum += lo_score * weight
+                total_weight += weight
+    
+    # Return weighted average
+    if total_weight > 0:
+        return weighted_sum / total_weight
+    
+    return 0.0
+
+
+def calculate_all_po_scores(student, use_credits=True):
+    """
+    Calculate all Program Outcome scores for a student across all courses.
+    
+    If use_credits=True: PO_Final = Σ(PO_from_course * CourseCredit) / Σ(CourseCredit)
+    If use_credits=False: PO_Final = Average of PO scores across courses
+    
+    Args:
+        student: Student instance
+        use_credits: Boolean, whether to weight by course credits
+    
+    Returns:
+        dict: {ProgramOutcome: score} mapping
+    """
+    from courses.models import Course
+    
+    # Get all active program outcomes
+    program_outcomes = ProgramOutcome.objects.filter(is_active=True)
+    
+    results = {}
+    
+    for po in program_outcomes:
+        # Get all courses that have LOs contributing to this PO
+        lo_mappings = LOPOMapping.objects.filter(
+            program_outcome=po
+        ).select_related('learning_outcome', 'learning_outcome__course')
+        
+        courses = set(mapping.learning_outcome.course for mapping in lo_mappings)
+        
+        if not courses:
+            results[po] = 0.0
+            continue
+        
+        if use_credits:
+            # Credit-weighted calculation
+            weighted_sum = 0.0
+            total_credits = 0.0
+            
+            for course in courses:
+                # Get completed enrollments for this course
+                enrollments = Enrollment.objects.filter(
+                    student=student,
+                    course=course,
+                    status='COMPLETED'
+                )
+                
+                if enrollments.exists():
+                    po_score = calculate_po_score(po, student, course)
+                    
+                    if po_score > 0:
+                        weighted_sum += po_score * course.credit
+                        total_credits += course.credit
+            
+            if total_credits > 0:
+                results[po] = weighted_sum / total_credits
+            else:
+                results[po] = 0.0
+        else:
+            # Simple average across courses
+            po_scores = []
+            
+            for course in courses:
+                enrollments = Enrollment.objects.filter(
+                    student=student,
+                    course=course,
+                    status='COMPLETED'
+                )
+                
+                if enrollments.exists():
+                    po_score = calculate_po_score(po, student, course)
+                    if po_score > 0:
+                        po_scores.append(po_score)
+            
+            if po_scores:
+                results[po] = sum(po_scores) / len(po_scores)
+            else:
+                results[po] = 0.0
+    
+    return results
+
+
+def calculate_student_lo_scores(student, course=None):
+    """
+    Calculate all Learning Outcome scores for a student.
+    
+    Args:
+        student: Student instance
+        course: Optional Course instance (if None, calculates for all courses)
+    
+    Returns:
+        dict: {LearningOutcome: score} mapping
+    """
+    # Get learning outcomes
+    learning_outcomes = LearningOutcome.objects.filter(is_active=True)
+    
+    if course:
+        learning_outcomes = learning_outcomes.filter(course=course)
+    
+    results = {}
+    
+    for lo in learning_outcomes:
+        enrollment = Enrollment.objects.filter(
+            student=student,
+            course=lo.course,
+            status='COMPLETED'
+        ).order_by('-year', '-semester').first()
+        
+        if enrollment:
+            results[lo] = calculate_lo_score(lo, student, enrollment)
+        else:
+            results[lo] = 0.0
+    
+    return results
+
+
+def get_student_po_summary(student):
+    """
+    Get a comprehensive summary of student's Program Outcome achievements.
+    
+    Args:
+        student: Student instance
+    
+    Returns:
+        dict: Comprehensive summary with scores and statistics
+    """
+    po_scores = calculate_all_po_scores(student, use_credits=True)
+    
+    summary = {
+        'student': student,
+        'po_scores': {},
+        'statistics': {
+            'average_po_score': 0.0,
+            'highest_po': None,
+            'lowest_po': None,
+            'completed_courses': 0,
+            'total_credits': 0,
+        }
+    }
+    
+    # Format PO scores
+    for po, score in po_scores.items():
+        summary['po_scores'][po.code] = {
+            'title': po.title,
+            'score': round(score, 2),
+            'achievement_level': _get_achievement_level(score)
+        }
+    
+    # Calculate statistics
+    if po_scores:
+        scores_only = [s for s in po_scores.values() if s > 0]
+        if scores_only:
+            summary['statistics']['average_po_score'] = round(sum(scores_only) / len(scores_only), 2)
+            
+            max_score = max(po_scores.values())
+            min_score = min([s for s in po_scores.values() if s > 0], default=0)
+            
+            for po, score in po_scores.items():
+                if score == max_score:
+                    summary['statistics']['highest_po'] = po.code
+                if score == min_score and score > 0:
+                    summary['statistics']['lowest_po'] = po.code
+    
+    # Get completed courses count
+    completed_enrollments = Enrollment.objects.filter(
+        student=student,
+        status='COMPLETED'
+    ).select_related('course')
+    
+    summary['statistics']['completed_courses'] = completed_enrollments.count()
+    summary['statistics']['total_credits'] = sum(
+        e.course.credit for e in completed_enrollments
+    )
+    
+    return summary
+
+
+def _get_achievement_level(score):
+    """Helper function to categorize scores into achievement levels"""
+    if score >= 85:
+        return 'EXCEEDED'
+    elif score >= 70:
+        return 'ACHIEVED'
+    elif score >= 50:
+        return 'PARTIALLY'
+    else:
+        return 'NOT_ACHIEVED'
+

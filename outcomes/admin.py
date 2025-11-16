@@ -7,7 +7,10 @@ from .models import (
     StudentPLOAchievement,
     LearningOutcome,
     ProgramOutcome,
-    Assessment
+    Assessment,
+    AssessmentLOMapping,
+    LOPOMapping,
+    StudentAssessmentScore
 )
 
 
@@ -79,3 +82,32 @@ class AssessmentAdmin(admin.ModelAdmin):
     filter_horizontal = ['learning_outcomes']
     readonly_fields = ['created_at', 'updated_at']
     date_hierarchy = 'due_date'
+
+
+@admin.register(AssessmentLOMapping)
+class AssessmentLOMappingAdmin(admin.ModelAdmin):
+    list_display = ['assessment', 'learning_outcome', 'contribution_percentage']
+    search_fields = ['assessment__name', 'learning_outcome__code']
+    raw_id_fields = ['assessment', 'learning_outcome']
+
+
+@admin.register(LOPOMapping)
+class LOPOMappingAdmin(admin.ModelAdmin):
+    list_display = ['learning_outcome', 'program_outcome', 'weight']
+    list_filter = ['weight']
+    search_fields = ['learning_outcome__code', 'program_outcome__code']
+    raw_id_fields = ['learning_outcome', 'program_outcome']
+
+
+@admin.register(StudentAssessmentScore)
+class StudentAssessmentScoreAdmin(admin.ModelAdmin):
+    list_display = ['student', 'assessment', 'score', 'normalized_score_display', 'graded_at']
+    list_filter = ['graded_at', 'assessment__assessment_type']
+    search_fields = ['student__name', 'assessment__name']
+    raw_id_fields = ['student', 'assessment', 'enrollment']
+    readonly_fields = ['graded_at', 'normalized_score_display']
+    
+    def normalized_score_display(self, obj):
+        return f"{obj.normalized_score():.2f}%"
+    normalized_score_display.short_description = 'Normalized Score'
+
