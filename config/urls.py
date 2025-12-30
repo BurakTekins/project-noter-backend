@@ -16,6 +16,7 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path, include
+from django.http import JsonResponse
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -23,4 +24,5 @@ urlpatterns = [
     path('api/', include('courses.urls')),
     path('api/', include('professors.urls')),
     path('api/', include('outcomes.urls')),
+    path('', lambda request: JsonResponse({"message": "Backend is running", "endpoints": ["/admin/", "/api/students/", "/api/courses/"]})),
 ]
